@@ -149,7 +149,7 @@ struct DeletedSectionsList
 		return sections;
 	}
 
-	void push(int view, int currAction, int startLine, int len);
+	bool push(int view, int currAction, int startLine, int len);
 	void pop(int view, int currAction, int startLine);
 
 	void clear()
@@ -165,20 +165,20 @@ private:
 };
 
 
-void DeletedSectionsList::push(int view, int currAction, int startLine, int len)
+bool DeletedSectionsList::push(int view, int currAction, int startLine, int len)
 {
 	if (len < 1)
-		return;
+		return false;
 
 	if (skipPush)
 	{
 		--skipPush;
-		return;
+		return false;
 	}
 
 	// Is it line replacement revert operation?
 	if (!sections.empty() && sections.back().restoreAction == currAction && sections.back().lineReplace)
-		return;
+		return false;
 
 	DeletedSection delSection(currAction, startLine, len);
 
@@ -200,6 +200,8 @@ void DeletedSectionsList::push(int view, int currAction, int startLine, int len)
 	sections.push_back(delSection);
 
 	lastPushTimeMark = ::GetTickCount();
+
+	return delSection.onlyAlignmentBlankChange;
 }
 
 
@@ -272,9 +274,9 @@ public:
 	void restore() const;
 	bool isOpen() const;
 
-	void pushDeletedSection(int sciAction, int startLine, int len)
+	bool pushDeletedSection(int sciAction, int startLine, int len)
 	{
-		deletedSections.push(compareViewId, sciAction, startLine, len);
+		return deletedSections.push(compareViewId, sciAction, startLine, len);
 	}
 
 	void popDeletedSection(int sciAction, int startLine)
@@ -282,10 +284,15 @@ public:
 		deletedSections.pop(compareViewId, sciAction, startLine);
 	}
 
-	void redoAlignmentBlankDeletion()
+	bool redoAlignmentBlankDeletion()
 	{
 		if (!deletedSections.get().empty() && deletedSections.get().back().onlyAlignmentBlankChange)
+		{
 			::PostMessage(getView(compareViewId), SCI_UNDO, 0, 0);
+			return true;
+		}
+
+		return false;
 	}
 
 	Temp_t	isTemp;
@@ -2846,15 +2853,21 @@ void onSciModified(SCNotification* notifyCode)
 
 			ScopedIncrementer incr(notificationsLock);
 
-			cmpPair->getFileByViewId(view).pushDeletedSection(action, startLine, endLine - startLine);
+			if (cmpPair->getFileByViewId(view).pushDeletedSection(action, startLine, endLine - startLine))
+				return;
 		}
 	}
 	else if ((notifyCode->modificationType & SC_MOD_DELETETEXT) && notifyCode->linesAdded)
 	{
 		if (!skipPushDeletedSection)
-			cmpPair->getFileByViewId(view).redoAlignmentBlankDeletion();
+		{
+			if (cmpPair->getFileByViewId(view).redoAlignmentBlankDeletion())
+				return;
+		}
 		else
+		{
 			skipPushDeletedSection = false;
+		}
 	}
 	else if (notifyCode->modificationType & SC_MOD_INSERTTEXT)
 	{
@@ -2866,6 +2879,8 @@ void onSciModified(SCNotification* notifyCode)
 				skipPushDeletedSection = true;
 
 			::PostMessage(getView(view), SCI_UNDO, 0, 0);
+
+			return;
 		}
 		else if (notifyCode->linesAdded)
 		{
@@ -2882,18 +2897,42 @@ void onSciModified(SCNotification* notifyCode)
 		}
 	}
 
-	if (!cmpPair->options.selectionCompare && Settings.RecompareOnChange &&
-		((notifyCode->modificationType & SC_MOD_DELETETEXT) || (notifyCode->modificationType & SC_MOD_INSERTTEXT)))
+	if ((notifyCode->modificationType & SC_MOD_DELETETEXT) || (notifyCode->modificationType & SC_MOD_INSERTTEXT))
 	{
 		delayedAlignment.cancel();
 		delayedUpdate.cancel();
 
-		if (notifyCode->linesAdded)
-			cmpPair->autoUpdateDelay = 400;
-		else
-			// Leave bigger delay before re-compare if change is on single line because the user might be typing
-			// and we shouldn't interrupt / interfere
-			cmpPair->autoUpdateDelay = 1000;
+		if (cmpPair->options.selectionCompare && notifyCode->linesAdded)
+		{
+			const int startLine = CallScintilla(view, SCI_LINEFROMPOSITION, notifyCode->position, 0);
+			const int endLine = startLine + notifyCode->linesAdded;
+
+			if (cmpPair->options.selections[view].first > startLine)
+			{
+				if (cmpPair->options.selections[view].first > endLine)
+					cmpPair->options.selections[view].first += notifyCode->linesAdded;
+				else
+					cmpPair->options.selections[view].first += (cmpPair->options.selections[view].first - startLine);
+			}
+
+			if (cmpPair->options.selections[view].second > startLine)
+			{
+				if (cmpPair->options.selections[view].second > endLine)
+					cmpPair->options.selections[view].second += notifyCode->linesAdded;
+				else
+					cmpPair->options.selections[view].second += (cmpPair->options.selections[view].second - startLine);
+			}
+		}
+
+		if (Settings.RecompareOnChange)
+		{
+			if (notifyCode->linesAdded)
+				cmpPair->autoUpdateDelay = 400;
+			else
+				// Leave bigger delay before re-compare if change is on single line because the user might be typing
+				// and we shouldn't interrupt / interfere
+				cmpPair->autoUpdateDelay = 1000;
+		}
 	}
 }
 
